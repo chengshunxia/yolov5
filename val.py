@@ -26,8 +26,16 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
+import datetime
 import torch
 from tqdm import tqdm
+import copy
+from poprt.runtime import RuntimeConfig
+
+
+from poprt import runtime
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -124,7 +132,8 @@ def run(
         plots=True,
         callbacks=Callbacks(),
         compute_loss=None,
-        ipu=False
+        ipu=False,
+        ipu_nms=False
 ):
     # Initialize/load model and set device
     training = model is not None
@@ -136,6 +145,8 @@ def run(
         
         if not ipu:
             device = select_device(device, batch_size=batch_size)
+        else:
+            device = select_device('cpu', batch_size=batch_size)
 
         # Directories
         save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -147,9 +158,15 @@ def run(
             stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
         else:
         ###load IPU popef model
-            model = None
+            config = RuntimeConfig()
+            config.timeout_ns = datetime.timedelta(microseconds=100)
+            config.batching_dim = 0
+            runner = runtime.ModelRunner("/opt/yolov5_xinao/session_cache/yolov5x1.popef", config)
+            runner = runtime.ModelRunner("./executable.popef", config)
+            outputs = runner.get_model_outputs()
             stride = 32 #How to modify it
-        
+            pt = False
+
         imgsz = check_img_size(imgsz, s=stride)  # check image size
         if not ipu:
             half = model.fp16  # FP16 supported on limited backends with CUDA
@@ -162,14 +179,15 @@ def run(
                     LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
 
         # Data
+        _data = data
         data = check_dataset(data)  # check
 
     if not ipu:
         # Configure
         model.eval()
         cuda = device.type != 'cpu'
-        iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
-        niou = iouv.numel()
+    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
+    niou = iouv.numel()
 
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
@@ -182,7 +200,7 @@ def run(
                 assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
                                 f'classes). Pass correct combination of --weights and --data that are trained together.'
             model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-            pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
+        pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         print (f"{data}")
         dataloader = create_dataloader(data[task],
@@ -197,15 +215,19 @@ def run(
 
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
-    names = model.names if hasattr(model, 'names') else model.module.names  # get class names
+    if not ipu:
+        names = model.names if hasattr(model, 'names') else model.module.names  # get class names
+    else:
+        if _data:
+            with open(_data, errors='ignore') as f:
+                names = yaml.safe_load(f)['names']  # class names
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
     s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
-    if not ipu:
-        loss = torch.zeros(3, device=device)
+    loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
@@ -216,11 +238,12 @@ def run(
                 if cuda:
                     im = im.to(device, non_blocking=True)
                     targets = targets.to(device)
-                im = im.half() if half else im.float()  # uint8 to fp16/32
-                im /= 255  # 0 - 255 to 0.0 - 1.0
-                nb, _, height, width = im.shape  # batch size, channels, height, width
             else:
                 pass
+
+            im = im.half() if half else im.float()  # uint8 to fp16/32
+            im /= 255  # 0 - 255 to 0.0 - 1.0
+            nb, _, height, width = im.shape  # batch size, channels, height, width
 
         # Inference
         with dt[1]:
@@ -230,23 +253,40 @@ def run(
                 if compute_loss:
                     loss += compute_loss(train_out, targets)[1]  # box, obj, cls
                 
-                targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-                lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             else:
-                preds, train_out = None, None
+                preds = {}
+                for x in outputs:
+                    updated_shape = copy.deepcopy(x.shape)
+                    updated_shape[0] = batch_size
+                    preds.update({x.name: np.zeros(updated_shape).astype(x.numpy_data_type())})
+                runner.execute({'images':im.to(torch.float16).numpy()}, preds)
+
+            targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
 
         # NMS
-
         with dt[2]:
-            if not ipu:
+            if not ipu_nms:
+                ##Convert IPU output to CPU/GPU output
+                if ipu:
+                    prediction = list()
+                    prediction.append( torch.from_numpy(preds['output']).to(device))
+                    l = list()
+                    l.append(torch.from_numpy(preds['701']).to(device))
+                    l.append(torch.from_numpy(preds['849']).to(device))
+                    l.append(torch.from_numpy(preds['997']).to(device))
+                    prediction.append(l)
+                    preds = prediction
+
                 preds = non_max_suppression(preds,
-                                        conf_thres,
-                                        iou_thres,
-                                        labels=lb,
-                                        multi_label=True,
-                                        agnostic=single_cls,
-                                        max_det=max_det)
+                                            conf_thres,
+                                            iou_thres,
+                                            labels=lb,
+                                            multi_label=True,
+                                            agnostic=single_cls,
+                                            max_det=max_det)
             else:
+                ###Convert IPU output(w/ NMS) to CPU/GPU output
                 pass
 
         # Metrics
@@ -289,6 +329,7 @@ def run(
 
         # Plot images
         if plots and batch_i < 3:
+            print (f"{name}")
             plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
             plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
@@ -351,7 +392,8 @@ def run(
             LOGGER.info(f'pycocotools unable to run: {e}')
 
     # Return results
-    model.float()  # for training
+    if not ipu:
+        model.float()  # for training
     if not training:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
@@ -386,6 +428,7 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--ipu', action='store_true', help="Use ipu to do the predict")
+    parser.add_argument('--ipu-nms', action='store_true', help="Use ipu to run NMS")
     opt = parser.parse_args()
     opt.data = check_yaml(opt.data)  # check YAML
     opt.save_json |= opt.data.endswith('coco.yaml')
